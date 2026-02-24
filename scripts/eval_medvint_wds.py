@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import torch
 import transformers
 from huggingface_hub import hf_hub_download
-from huggingface_hub.errors import EntryNotFoundError
+from huggingface_hub.errors import EntryNotFoundError, LocalEntryNotFoundError
 from PIL import Image
 from torchvision import transforms
 
@@ -99,6 +99,20 @@ class ModelManager:
             remote_name = download_filename or (value if value else default_rel)
             if remote_name.startswith("medvint/"):
                 remote_name = remote_name[len("medvint/") :]
+
+            # Ask HF cache first by canonical key (repo_id + filename).
+            try:
+                cached = hf_hub_download(
+                    repo_id=download_repo_id,
+                    filename=remote_name,
+                    cache_dir=str(self.checkpoints_dir / "hf_cache"),
+                    local_files_only=True,
+                )
+                self._log(f"[cache] hit hf://{download_repo_id}/{remote_name} -> {cached}")
+                return Path(cached)
+            except LocalEntryNotFoundError:
+                pass
+
             self._log(f"[cache] miss {value or default_rel}; downloading {remote_name} from {download_repo_id}")
             try:
                 downloaded = hf_hub_download(
