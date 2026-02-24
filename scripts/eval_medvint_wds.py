@@ -13,10 +13,10 @@ from types import SimpleNamespace
 
 import torch
 import transformers
-from PIL import Image
-from torchvision import transforms
 from huggingface_hub import hf_hub_download
 from huggingface_hub.errors import EntryNotFoundError
+from PIL import Image
+from torchvision import transforms
 
 try:
     import webdataset as wds
@@ -27,24 +27,28 @@ except ImportError as e:
 class ModelManager:
     _patch_applied = False
 
-    def __init__(self, repo_root: Path, checkpoints_dir: Path, device: str):
+    def __init__(self, repo_root: Path, checkpoints_dir: Path, device: str, verbose: bool = True):
         self.repo_root = repo_root
         self.checkpoints_dir = checkpoints_dir
         self.device = device
+        self.verbose = verbose
         self._model = None
         self._tokenizer = None
 
+    def _log(self, msg: str) -> None:
+        if self.verbose:
+            print(msg, flush=True)
+
     @classmethod
-    def _apply_compat_patches(cls, checkpoints_dir: Path, device: str) -> None:
+    def _apply_compat_patches(cls, checkpoints_dir: Path, device: str, llm_torch_dtype: torch.dtype) -> None:
         if cls._patch_applied:
             return
 
         orig_from_pretrained = transformers.LlamaForCausalLM.from_pretrained
 
         def patched_from_pretrained(*args, **kwargs):
-            kwargs.setdefault("torch_dtype", torch.float16 if device != "cpu" else torch.float32)
+            kwargs.setdefault("torch_dtype", llm_torch_dtype)
             kwargs.setdefault("low_cpu_mem_usage", True)
-            # If a hub id is provided, downloaded weights are cached under checkpoints_dir.
             if args and not Path(str(args[0])).exists():
                 kwargs.setdefault("cache_dir", str(checkpoints_dir / "hf_cache"))
                 kwargs.setdefault("local_files_only", True)
@@ -52,7 +56,10 @@ class ModelManager:
                     return orig_from_pretrained(*args, **kwargs)
                 except OSError:
                     kwargs["local_files_only"] = False
-                    print(f"Local cache miss for {args[0]}; downloading into {checkpoints_dir / 'hf_cache'}")
+                    print(
+                        f"[cache] miss model={args[0]}; downloading into {checkpoints_dir / 'hf_cache'}",
+                        flush=True,
+                    )
                     return orig_from_pretrained(*args, **kwargs)
             return orig_from_pretrained(*args, **kwargs)
 
@@ -61,7 +68,6 @@ class ModelManager:
         orig_torch_load = torch.load
 
         def patched_torch_load(*args, **kwargs):
-            # Required for legacy checkpoints on torch>=2.6.
             kwargs.setdefault("weights_only", False)
             return orig_torch_load(*args, **kwargs)
 
@@ -77,17 +83,23 @@ class ModelManager:
     ) -> Path:
         candidate = Path(value) if value else self.checkpoints_dir / default_rel
         if candidate.is_absolute() and candidate.exists():
+            self._log(f"[cache] hit {candidate}")
             return candidate
+
         alt = (self.checkpoints_dir / value) if value else (self.checkpoints_dir / default_rel)
         if alt.exists():
+            self._log(f"[cache] hit {alt}")
             return alt
+
         if candidate.exists():
+            self._log(f"[cache] hit {candidate}")
             return candidate
+
         if download_repo_id:
             remote_name = download_filename or (value if value else default_rel)
             if remote_name.startswith("medvint/"):
                 remote_name = remote_name[len("medvint/") :]
-            print(f"Local miss for {value or default_rel}; downloading {remote_name} from {download_repo_id}")
+            self._log(f"[cache] miss {value or default_rel}; downloading {remote_name} from {download_repo_id}")
             try:
                 downloaded = hf_hub_download(
                     repo_id=download_repo_id,
@@ -100,24 +112,32 @@ class ModelManager:
                     "Override with --vision-repo-id/--vision-filename or "
                     "--checkpoint-repo-id/--checkpoint-filename."
                 ) from e
+            self._log(f"[cache] stored {downloaded}")
             return Path(downloaded)
+
         raise FileNotFoundError(f"Could not resolve checkpoint path: {value or default_rel}")
 
     def _resolve_local_or_hub(self, value: str, default_rel: str, hub_fallback: str | None = None) -> str:
         candidate = Path(value) if value else self.checkpoints_dir / default_rel
         if candidate.is_absolute() and candidate.exists():
+            self._log(f"[cache] hit {candidate}")
             return str(candidate)
+
         alt = (self.checkpoints_dir / value) if value else (self.checkpoints_dir / default_rel)
         if alt.exists():
+            self._log(f"[cache] hit {alt}")
             return str(alt)
+
         if candidate.exists():
+            self._log(f"[cache] hit {candidate}")
             return str(candidate)
-        # Fall back to hub id when a repo id is provided.
+
         if value and "/" in value and not value.endswith((".bin", ".pt", ".json", ".model")):
             return value
-        # If local default/key is missing, allow explicit hub fallback.
+
         if hub_fallback:
             return hub_fallback
+
         raise FileNotFoundError(f"Could not resolve model/tokenizer path locally: {value or default_rel}")
 
     def load(
@@ -126,6 +146,7 @@ class ModelManager:
         tokenizer_path: str | None,
         vision_model_path: str | None,
         checkpoint: str | None,
+        llm_torch_dtype: torch.dtype,
         model_repo_id: str | None = None,
         tokenizer_repo_id: str | None = None,
         vision_repo_id: str | None = None,
@@ -134,9 +155,11 @@ class ModelManager:
         checkpoint_filename: str | None = None,
     ):
         if self._model is not None and self._tokenizer is not None:
+            self._log("[model] using in-memory cache")
             return self._model, self._tokenizer
 
-        self._apply_compat_patches(self.checkpoints_dir, self.device)
+        self._log("[model] applying compatibility patches")
+        self._apply_compat_patches(self.checkpoints_dir, self.device, llm_torch_dtype)
 
         import sys
 
@@ -146,9 +169,7 @@ class ModelManager:
 
         from models.QA_model import QA_model
 
-        resolved_model_path = self._resolve_local_or_hub(
-            model_path or "", "PMC_LLAMA_7B", hub_fallback=model_repo_id
-        )
+        resolved_model_path = self._resolve_local_or_hub(model_path or "", "PMC_LLAMA_7B", hub_fallback=model_repo_id)
         resolved_tokenizer_path = self._resolve_local_or_hub(
             tokenizer_path or "", "PMC_LLAMA_7B", hub_fallback=tokenizer_repo_id
         )
@@ -165,6 +186,11 @@ class ModelManager:
             download_filename=checkpoint_filename
             or "VQA_lora_PMC_LLaMA_PMCCLIP/choice/checkpoint-4000/pytorch_model.bin",
         )
+
+        self._log(f"[model] llm={resolved_model_path}")
+        self._log(f"[model] tokenizer={resolved_tokenizer_path}")
+        self._log(f"[model] vision={resolved_vision_path}")
+        self._log(f"[model] checkpoint={resolved_checkpoint}")
 
         model_args = SimpleNamespace(
             model_path=str(resolved_model_path),
@@ -183,17 +209,23 @@ class ModelManager:
         )
 
         model = QA_model(model_args)
+        self._log("[model] loading checkpoint into model")
         state = torch.load(str(resolved_checkpoint), map_location="cpu")
         target_keys = set(model.state_dict().keys())
         state = remap_state_dict_keys(state, target_keys=target_keys)
         missing_keys, unexpected_keys = model.load_state_dict(state, strict=False)
         if unexpected_keys:
-            print(f"Warning: ignored unexpected checkpoint keys: {len(unexpected_keys)}")
+            self._log(f"[warn] ignored unexpected checkpoint keys={len(unexpected_keys)}")
         if missing_keys:
-            # Keep this explicit so we fail fast if compatibility mapping regresses.
             raise RuntimeError(f"Missing keys after remap/load: {len(missing_keys)}")
+
         model = model.to(self.device)
         model.eval()
+        self._log(f"[model] ready on device={self.device}")
+        self._log(
+            f"[dtype] llama_embed={self.llm_dtype(model)} "
+            f"vision_conv1={self.vision_dtype(model)}"
+        )
 
         tokenizer_kwargs = {}
         if not Path(str(resolved_tokenizer_path)).exists():
@@ -205,16 +237,30 @@ class ModelManager:
                 )
             except OSError:
                 tokenizer_kwargs["local_files_only"] = False
-                print(f"Local tokenizer cache miss for {resolved_tokenizer_path}; downloading into {self.checkpoints_dir / 'hf_cache'}")
+                self._log(
+                    f"[cache] miss tokenizer={resolved_tokenizer_path}; downloading into {self.checkpoints_dir / 'hf_cache'}"
+                )
                 tokenizer = transformers.LlamaTokenizer.from_pretrained(
                     str(resolved_tokenizer_path), legacy=True, **tokenizer_kwargs
                 )
         else:
             tokenizer = transformers.LlamaTokenizer.from_pretrained(str(resolved_tokenizer_path), legacy=True)
 
+        self._log("[model] tokenizer loaded")
         self._model = model
         self._tokenizer = tokenizer
         return self._model, self._tokenizer
+
+    @staticmethod
+    def llm_dtype(model) -> str:
+        return str(model.llamacasual.get_input_embeddings().weight.dtype)
+
+    @staticmethod
+    def vision_dtype(model) -> str:
+        try:
+            return str(next(model.vision_model.parameters()).dtype)
+        except StopIteration:
+            return "unknown"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -245,9 +291,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--max-samples", type=int, default=3)
     p.add_argument("--image-size", type=int, default=224)
+    p.add_argument("--llm-dtype", type=str, default="float16", choices=["float16", "bfloat16", "float32"])
     p.add_argument("--output-csv", type=str, default=str(repo / "eval_runs/minimal_eval_results.csv"))
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "mps", "cuda"])
     p.add_argument("--predictor", type=str, default="model", choices=["model", "oracle", "random"])
+    p.add_argument("--verbose", action=argparse.BooleanOptionalAction, default=True)
     return p
 
 
@@ -330,7 +378,12 @@ class WebDatasetQALoader:
 
 
 def build_prompt(payload: dict) -> tuple[str, list[str], str]:
-    choices = [payload.get("choice_a", ""), payload.get("choice_b", ""), payload.get("choice_c", ""), payload.get("choice_d", "")]
+    choices = [
+        payload.get("choice_a", ""),
+        payload.get("choice_b", ""),
+        payload.get("choice_c", ""),
+        payload.get("choice_d", ""),
+    ]
     question = payload.get("question", "")
     prompt = f"Question: {question}Choices:{choices[0]}{choices[1]}{choices[2]}{choices[3]}The Answer is:"
     gold_label = str(payload.get("answer_label", "")).strip().upper()[:1]
@@ -357,6 +410,17 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
+    def log(msg: str) -> None:
+        if args.verbose:
+            print(msg, flush=True)
+
+    llm_dtype_map = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+    }
+    llm_torch_dtype = llm_dtype_map[args.llm_dtype]
+
     repo_root = Path(__file__).resolve().parents[1]
     checkpoints_dir = Path(args.checkpoints_dir).expanduser().resolve()
     datashards_dir = Path(args.datashards_dir).expanduser().resolve()
@@ -368,19 +432,23 @@ def main() -> None:
     output_csv.parent.mkdir(parents=True, exist_ok=True)
 
     device = choose_device(args.device)
-    print(f"Using device: {device}")
-    print(f"Checkpoints dir: {checkpoints_dir}")
-    print(f"Datashards dir: {datashards_dir}")
+    log(
+        f"[run] predictor={args.predictor} device={device} max_samples={args.max_samples} "
+        f"llm_dtype={args.llm_dtype}"
+    )
+    log(f"[run] checkpoints_dir={checkpoints_dir}")
+    log(f"[run] datashards_dir={datashards_dir}")
 
     model = None
     tokenizer = None
     if args.predictor == "model":
-        manager = ModelManager(repo_root=repo_root, checkpoints_dir=checkpoints_dir, device=device)
+        manager = ModelManager(repo_root=repo_root, checkpoints_dir=checkpoints_dir, device=device, verbose=args.verbose)
         model, tokenizer = manager.load(
             model_path=args.model_path,
             tokenizer_path=args.tokenizer_path,
             vision_model_path=args.vision_model_path,
             checkpoint=args.checkpoint,
+            llm_torch_dtype=llm_torch_dtype,
             model_repo_id=args.model_repo_id,
             tokenizer_repo_id=args.tokenizer_repo_id,
             vision_repo_id=args.vision_repo_id,
@@ -398,6 +466,7 @@ def main() -> None:
     )
 
     shard_pattern = resolve_shard_glob(datashards_dir, args.shards)
+    log(f"[data] shard_pattern={shard_pattern}")
     qa_loader = WebDatasetQALoader(shard_pattern)
 
     correct = 0
@@ -413,7 +482,8 @@ def main() -> None:
         for shard_name, sample_id, payload, image in qa_loader:
             prompt, choices, gold_label = build_prompt(payload)
             continuation = ""
-            print(f"starting sample={sample_id}", flush=True)
+            log(f"[eval] step={total+1}/{args.max_samples} sample={sample_id} shard={shard_name}")
+
             if args.predictor == "model":
                 encoded = tokenizer(prompt, return_tensors="pt")
                 input_ids = encoded["input_ids"].to(device)
@@ -450,17 +520,17 @@ def main() -> None:
                 }
             )
 
-            print(
-                f"step={total} sample={sample_id} gold={gold_label} pred={pred_label} "
-                f"correct={is_correct} text={continuation[:80]!r}"
+            log(
+                f"[eval] done step={total}/{args.max_samples} sample={sample_id} "
+                f"gold={gold_label} pred={pred_label} correct={is_correct} text={continuation[:80]!r}"
             )
 
             if total >= args.max_samples:
                 break
 
     acc = correct / total if total else 0.0
-    print(f"Finished {total} samples. accuracy={acc:.4f}")
-    print(f"Wrote: {output_csv}")
+    log(f"[result] finished samples={total} accuracy={acc:.4f}")
+    log(f"[result] wrote_csv={output_csv}")
 
 
 if __name__ == "__main__":

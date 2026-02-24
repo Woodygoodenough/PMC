@@ -196,7 +196,9 @@ class QA_model(nn.Module):
         features = self.fc_l2(features)
         features = rearrange(features,'(b n) d -> b n d',b=B)
         ### LLM ###
-        input_embedding = self.llamacasual.get_input_embeddings()(input_ids)
+        llm_dtype = self.llamacasual.get_input_embeddings().weight.dtype
+        features = features.to(llm_dtype)
+        input_embedding = self.llamacasual.get_input_embeddings()(input_ids).to(llm_dtype)
         input_embedding = torch.cat([features,input_embedding], dim=1)
         
         output = self.llamacasual(inputs_embeds = input_embedding, labels = labels)
@@ -221,7 +223,9 @@ class QA_model(nn.Module):
             features = self.fc_l2(features)
             features = rearrange(features,'(b n) d -> b n d',b=B)
             ### LLM ###
-            input_embedding = self.llamacasual.get_input_embeddings()(input_ids)
+            llm_dtype = self.llamacasual.get_input_embeddings().weight.dtype
+            features = features.to(llm_dtype)
+            input_embedding = self.llamacasual.get_input_embeddings()(input_ids).to(llm_dtype)
             input_embedding = torch.cat([features,input_embedding], dim=1)
             
             generation = self.llamacasual(inputs_embeds = input_embedding)['logits']
@@ -246,7 +250,9 @@ class QA_model(nn.Module):
             features = self.fc_l2(features)
             features = rearrange(features,'(b n) d -> b n d',b=B)
             ### LLM ###
-            input_embedding = self.llamacasual.get_input_embeddings()(input_ids)
+            llm_dtype = self.llamacasual.get_input_embeddings().weight.dtype
+            features = features.to(llm_dtype)
+            input_embedding = self.llamacasual.get_input_embeddings()(input_ids).to(llm_dtype)
             input_embedding = torch.cat([features,input_embedding], dim=1)
             
             #generation = self.llamacasual(inputs_embeds = input_embedding)['logits']
