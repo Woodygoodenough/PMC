@@ -1,0 +1,50 @@
+# OS / editor
+.DS_Store
+*.swp
+*.swo
+*.pdf
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Local environments / caches
+.venv/
+.venv*/
+venv/
+.env
+.cache/
+.huggingface/
+
+# Large datasets / shards
+/data/
+/eval_data/
+*.tar
+*.tar.gz
+*.zip
+
+# Model artifacts
+/models/
+*.bin
+*.pt
+*.ckpt
+*.safetensors
+
+# Eval outputs / run logs
+/eval_runs/
+*.log
+
+# Keep useful code/docs tracked
+!/scripts/
+!/scripts/*.py
+!/docs/
+!/docs/*.md
+
+# Upstream local clone artifacts
+upstream_pmcvqa/.git/
+upstream_pmcvqa/PMC-VQA/
+upstream_pmcvqa/Slake1.0/
+
+.venv*/
