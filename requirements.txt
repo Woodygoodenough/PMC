@@ -1,7 +1,8 @@
 torch
 torchvision
-transformers==4.31.0
-peft==0.4.0
+transformers>=4.45,<4.48
+tokenizers>=0.20,<0.21
+peft>=0.13,<0.14
 einops
 pandas
 pillow
