@@ -77,7 +77,7 @@ class ModelManager:
             return candidate
         raise FileNotFoundError(f"Could not resolve checkpoint path: {value or default_rel}")
 
-    def _resolve_local_or_hub(self, value: str, default_rel: str) -> str:
+    def _resolve_local_or_hub(self, value: str, default_rel: str, hub_fallback: str | None = None) -> str:
         candidate = Path(value) if value else self.checkpoints_dir / default_rel
         if candidate.is_absolute() and candidate.exists():
             return str(candidate)
@@ -86,12 +86,23 @@ class ModelManager:
             return str(alt)
         if candidate.exists():
             return str(candidate)
-        # Fall back to hub id only when user explicitly passed a non-path token.
+        # Fall back to hub id when a repo id is provided.
         if value and "/" in value and not value.endswith((".bin", ".pt", ".json", ".model")):
             return value
+        # If local default/key is missing, allow explicit hub fallback.
+        if hub_fallback:
+            return hub_fallback
         raise FileNotFoundError(f"Could not resolve model/tokenizer path locally: {value or default_rel}")
 
-    def load(self, model_path: str | None, tokenizer_path: str | None, vision_model_path: str | None, checkpoint: str | None):
+    def load(
+        self,
+        model_path: str | None,
+        tokenizer_path: str | None,
+        vision_model_path: str | None,
+        checkpoint: str | None,
+        model_repo_id: str | None = None,
+        tokenizer_repo_id: str | None = None,
+    ):
         if self._model is not None and self._tokenizer is not None:
             return self._model, self._tokenizer
 
@@ -105,8 +116,12 @@ class ModelManager:
 
         from models.QA_model import QA_model
 
-        resolved_model_path = self._resolve_local_or_hub(model_path or "", "PMC_LLAMA_7B")
-        resolved_tokenizer_path = self._resolve_local_or_hub(tokenizer_path or "", "PMC_LLAMA_7B")
+        resolved_model_path = self._resolve_local_or_hub(
+            model_path or "", "PMC_LLAMA_7B", hub_fallback=model_repo_id
+        )
+        resolved_tokenizer_path = self._resolve_local_or_hub(
+            tokenizer_path or "", "PMC_LLAMA_7B", hub_fallback=tokenizer_repo_id
+        )
         resolved_vision_path = self._resolve_path(vision_model_path or "", "medvint/pmc_clip/checkpoint.pt")
         resolved_checkpoint = self._resolve_path(
             checkpoint or "",
@@ -173,6 +188,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--model-path", type=str, default="PMC_LLAMA_7B")
     p.add_argument("--tokenizer-path", type=str, default="PMC_LLAMA_7B")
+    p.add_argument("--model-repo-id", type=str, default="chaoyi-wu/PMC_LLAMA_7B")
+    p.add_argument("--tokenizer-repo-id", type=str, default="chaoyi-wu/PMC_LLAMA_7B")
     p.add_argument("--vision-model-path", type=str, default="medvint/pmc_clip/checkpoint.pt")
     p.add_argument(
         "--checkpoint",
@@ -318,6 +335,8 @@ def main() -> None:
             tokenizer_path=args.tokenizer_path,
             vision_model_path=args.vision_model_path,
             checkpoint=args.checkpoint,
+            model_repo_id=args.model_repo_id,
+            tokenizer_repo_id=args.tokenizer_repo_id,
         )
 
     image_transform = transforms.Compose(
