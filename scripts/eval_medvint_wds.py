@@ -39,6 +39,16 @@ class ModelManager:
         if self.verbose:
             print(msg, flush=True)
 
+    @staticmethod
+    def _is_readable_file(path: Path) -> bool:
+        try:
+            if not path.is_file():
+                return False
+            with path.open("rb"):
+                return True
+        except OSError:
+            return False
+
     @classmethod
     def _apply_compat_patches(cls, checkpoints_dir: Path, device: str, llm_torch_dtype: torch.dtype) -> None:
         if cls._patch_applied:
@@ -106,17 +116,21 @@ class ModelManager:
                 filename=remote_name,
                 cache_dir=str(self.checkpoints_dir / "hf_cache"),
             )
-            if isinstance(cached, str) and Path(cached).exists():
-                self._log(f"[cache] hit hf://{download_repo_id}/{remote_name} -> {cached}")
-                return Path(cached)
+            if isinstance(cached, str):
+                cached_path = Path(cached)
+                if self._is_readable_file(cached_path):
+                    self._log(f"[cache] hit hf://{download_repo_id}/{remote_name} -> {cached_path}")
+                    return cached_path
+                self._log(f"[cache] stale hf entry ignored hf://{download_repo_id}/{remote_name} -> {cached_path}")
 
             # Fallback for environments where refs metadata is stale but snapshots exist.
             repo_cache_dir = self.checkpoints_dir / "hf_cache" / f"models--{download_repo_id.replace('/', '--')}"
             snapshot_hits = sorted(repo_cache_dir.glob(f"snapshots/*/{remote_name}"))
-            if snapshot_hits:
-                picked = snapshot_hits[-1]
-                self._log(f"[cache] hit snapshot://{download_repo_id}/{remote_name} -> {picked}")
-                return picked
+            for picked in reversed(snapshot_hits):
+                if self._is_readable_file(picked):
+                    self._log(f"[cache] hit snapshot://{download_repo_id}/{remote_name} -> {picked}")
+                    return picked
+                self._log(f"[cache] stale snapshot ignored snapshot://{download_repo_id}/{remote_name} -> {picked}")
 
             try:
                 cached = hf_hub_download(
