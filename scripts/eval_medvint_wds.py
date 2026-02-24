@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 import torch
 import transformers
-from huggingface_hub import hf_hub_download
+from huggingface_hub import hf_hub_download, try_to_load_from_cache
 from huggingface_hub.errors import EntryNotFoundError, LocalEntryNotFoundError
 from PIL import Image
 from torchvision import transforms
@@ -100,7 +100,24 @@ class ModelManager:
             if remote_name.startswith("medvint/"):
                 remote_name = remote_name[len("medvint/") :]
 
-            # Ask HF cache first by canonical key (repo_id + filename).
+            # First-class cache probe (no network).
+            cached = try_to_load_from_cache(
+                repo_id=download_repo_id,
+                filename=remote_name,
+                cache_dir=str(self.checkpoints_dir / "hf_cache"),
+            )
+            if isinstance(cached, str) and Path(cached).exists():
+                self._log(f"[cache] hit hf://{download_repo_id}/{remote_name} -> {cached}")
+                return Path(cached)
+
+            # Fallback for environments where refs metadata is stale but snapshots exist.
+            repo_cache_dir = self.checkpoints_dir / "hf_cache" / f"models--{download_repo_id.replace('/', '--')}"
+            snapshot_hits = sorted(repo_cache_dir.glob(f"snapshots/*/{remote_name}"))
+            if snapshot_hits:
+                picked = snapshot_hits[-1]
+                self._log(f"[cache] hit snapshot://{download_repo_id}/{remote_name} -> {picked}")
+                return picked
+
             try:
                 cached = hf_hub_download(
                     repo_id=download_repo_id,
