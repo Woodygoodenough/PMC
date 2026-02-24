@@ -16,6 +16,7 @@ import transformers
 from PIL import Image
 from torchvision import transforms
 from huggingface_hub import hf_hub_download
+from huggingface_hub.errors import EntryNotFoundError
 
 try:
     import webdataset as wds
@@ -87,11 +88,18 @@ class ModelManager:
             if remote_name.startswith("medvint/"):
                 remote_name = remote_name[len("medvint/") :]
             print(f"Local miss for {value or default_rel}; downloading {remote_name} from {download_repo_id}")
-            downloaded = hf_hub_download(
-                repo_id=download_repo_id,
-                filename=remote_name,
-                cache_dir=str(self.checkpoints_dir / "hf_cache"),
-            )
+            try:
+                downloaded = hf_hub_download(
+                    repo_id=download_repo_id,
+                    filename=remote_name,
+                    cache_dir=str(self.checkpoints_dir / "hf_cache"),
+                )
+            except EntryNotFoundError as e:
+                raise FileNotFoundError(
+                    f"Remote file not found: repo={download_repo_id}, filename={remote_name}. "
+                    "Override with --vision-repo-id/--vision-filename or "
+                    "--checkpoint-repo-id/--checkpoint-filename."
+                ) from e
             return Path(downloaded)
         raise FileNotFoundError(f"Could not resolve checkpoint path: {value or default_rel}")
 
@@ -120,7 +128,10 @@ class ModelManager:
         checkpoint: str | None,
         model_repo_id: str | None = None,
         tokenizer_repo_id: str | None = None,
-        medvint_repo_id: str | None = None,
+        vision_repo_id: str | None = None,
+        vision_filename: str | None = None,
+        checkpoint_repo_id: str | None = None,
+        checkpoint_filename: str | None = None,
     ):
         if self._model is not None and self._tokenizer is not None:
             return self._model, self._tokenizer
@@ -144,14 +155,15 @@ class ModelManager:
         resolved_vision_path = self._resolve_path(
             vision_model_path or "",
             "medvint/pmc_clip/checkpoint.pt",
-            download_repo_id=medvint_repo_id,
-            download_filename="pmc_clip/checkpoint.pt",
+            download_repo_id=vision_repo_id,
+            download_filename=vision_filename or "pmc_clip/checkpoint.pt",
         )
         resolved_checkpoint = self._resolve_path(
             checkpoint or "",
             "medvint/VQA_lora_PMC_LLaMA_PMCCLIP/choice/checkpoint-4000/pytorch_model.bin",
-            download_repo_id=medvint_repo_id,
-            download_filename="VQA_lora_PMC_LLaMA_PMCCLIP/choice/checkpoint-4000/pytorch_model.bin",
+            download_repo_id=checkpoint_repo_id,
+            download_filename=checkpoint_filename
+            or "VQA_lora_PMC_LLaMA_PMCCLIP/choice/checkpoint-4000/pytorch_model.bin",
         )
 
         model_args = SimpleNamespace(
@@ -216,7 +228,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tokenizer-path", type=str, default="PMC_LLAMA_7B")
     p.add_argument("--model-repo-id", type=str, default="chaoyi-wu/PMC_LLAMA_7B")
     p.add_argument("--tokenizer-repo-id", type=str, default="chaoyi-wu/PMC_LLAMA_7B")
-    p.add_argument("--medvint-repo-id", type=str, default="xmcmic/MedVInT-TD")
+    p.add_argument("--vision-repo-id", type=str, default="xmcmic/MedVInT-TE")
+    p.add_argument("--vision-filename", type=str, default="pmc_clip/checkpoint.pt")
+    p.add_argument("--checkpoint-repo-id", type=str, default="xmcmic/MedVInT-TD")
+    p.add_argument(
+        "--checkpoint-filename",
+        type=str,
+        default="VQA_lora_PMC_LLaMA_PMCCLIP/choice/checkpoint-4000/pytorch_model.bin",
+    )
     p.add_argument("--vision-model-path", type=str, default="medvint/pmc_clip/checkpoint.pt")
     p.add_argument(
         "--checkpoint",
@@ -364,7 +383,10 @@ def main() -> None:
             checkpoint=args.checkpoint,
             model_repo_id=args.model_repo_id,
             tokenizer_repo_id=args.tokenizer_repo_id,
-            medvint_repo_id=args.medvint_repo_id,
+            vision_repo_id=args.vision_repo_id,
+            vision_filename=args.vision_filename,
+            checkpoint_repo_id=args.checkpoint_repo_id,
+            checkpoint_filename=args.checkpoint_filename,
         )
 
     image_transform = transforms.Compose(
