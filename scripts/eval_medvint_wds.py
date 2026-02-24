@@ -8,6 +8,7 @@ import glob
 import json
 import random
 import re
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -48,6 +49,25 @@ class ModelManager:
                 return True
         except OSError:
             return False
+
+    def _materialize_checkpoint(self, source: Path, requested_value: str, default_rel: str) -> Path:
+        target = Path(requested_value) if requested_value else (self.checkpoints_dir / default_rel)
+        if not target.is_absolute():
+            target = self.checkpoints_dir / target
+        target = target.resolve()
+
+        if source.resolve() == target:
+            return source
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if self._is_readable_file(target):
+            return target
+
+        shutil.copy2(source, target)
+        if not self._is_readable_file(target):
+            raise FileNotFoundError(f"Materialized checkpoint is not readable: {target}")
+        self._log(f"[cache] materialized {target}")
+        return target
 
     @classmethod
     def _apply_compat_patches(cls, checkpoints_dir: Path, device: str, llm_torch_dtype: torch.dtype) -> None:
@@ -120,7 +140,7 @@ class ModelManager:
                 cached_path = Path(cached)
                 if self._is_readable_file(cached_path):
                     self._log(f"[cache] hit hf://{download_repo_id}/{remote_name} -> {cached_path}")
-                    return cached_path
+                    return self._materialize_checkpoint(cached_path, value, default_rel)
                 self._log(f"[cache] stale hf entry ignored hf://{download_repo_id}/{remote_name} -> {cached_path}")
 
             # Fallback for environments where refs metadata is stale but snapshots exist.
@@ -129,7 +149,7 @@ class ModelManager:
             for picked in reversed(snapshot_hits):
                 if self._is_readable_file(picked):
                     self._log(f"[cache] hit snapshot://{download_repo_id}/{remote_name} -> {picked}")
-                    return picked
+                    return self._materialize_checkpoint(picked, value, default_rel)
                 self._log(f"[cache] stale snapshot ignored snapshot://{download_repo_id}/{remote_name} -> {picked}")
 
             try:
@@ -140,7 +160,7 @@ class ModelManager:
                     local_files_only=True,
                 )
                 self._log(f"[cache] hit hf://{download_repo_id}/{remote_name} -> {cached}")
-                return Path(cached)
+                return self._materialize_checkpoint(Path(cached), value, default_rel)
             except LocalEntryNotFoundError:
                 pass
 
@@ -158,7 +178,7 @@ class ModelManager:
                     "--checkpoint-repo-id/--checkpoint-filename."
                 ) from e
             self._log(f"[cache] stored {downloaded}")
-            return Path(downloaded)
+            return self._materialize_checkpoint(Path(downloaded), value, default_rel)
 
         raise FileNotFoundError(f"Could not resolve checkpoint path: {value or default_rel}")
 
