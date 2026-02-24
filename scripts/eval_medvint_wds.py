@@ -15,6 +15,7 @@ import torch
 import transformers
 from PIL import Image
 from torchvision import transforms
+from huggingface_hub import hf_hub_download
 
 try:
     import webdataset as wds
@@ -66,7 +67,13 @@ class ModelManager:
         torch.load = patched_torch_load
         cls._patch_applied = True
 
-    def _resolve_path(self, value: str, default_rel: str) -> Path:
+    def _resolve_path(
+        self,
+        value: str,
+        default_rel: str,
+        download_repo_id: str | None = None,
+        download_filename: str | None = None,
+    ) -> Path:
         candidate = Path(value) if value else self.checkpoints_dir / default_rel
         if candidate.is_absolute() and candidate.exists():
             return candidate
@@ -75,6 +82,17 @@ class ModelManager:
             return alt
         if candidate.exists():
             return candidate
+        if download_repo_id:
+            remote_name = download_filename or (value if value else default_rel)
+            if remote_name.startswith("medvint/"):
+                remote_name = remote_name[len("medvint/") :]
+            print(f"Local miss for {value or default_rel}; downloading {remote_name} from {download_repo_id}")
+            downloaded = hf_hub_download(
+                repo_id=download_repo_id,
+                filename=remote_name,
+                cache_dir=str(self.checkpoints_dir / "hf_cache"),
+            )
+            return Path(downloaded)
         raise FileNotFoundError(f"Could not resolve checkpoint path: {value or default_rel}")
 
     def _resolve_local_or_hub(self, value: str, default_rel: str, hub_fallback: str | None = None) -> str:
@@ -102,6 +120,7 @@ class ModelManager:
         checkpoint: str | None,
         model_repo_id: str | None = None,
         tokenizer_repo_id: str | None = None,
+        medvint_repo_id: str | None = None,
     ):
         if self._model is not None and self._tokenizer is not None:
             return self._model, self._tokenizer
@@ -122,10 +141,17 @@ class ModelManager:
         resolved_tokenizer_path = self._resolve_local_or_hub(
             tokenizer_path or "", "PMC_LLAMA_7B", hub_fallback=tokenizer_repo_id
         )
-        resolved_vision_path = self._resolve_path(vision_model_path or "", "medvint/pmc_clip/checkpoint.pt")
+        resolved_vision_path = self._resolve_path(
+            vision_model_path or "",
+            "medvint/pmc_clip/checkpoint.pt",
+            download_repo_id=medvint_repo_id,
+            download_filename="pmc_clip/checkpoint.pt",
+        )
         resolved_checkpoint = self._resolve_path(
             checkpoint or "",
             "medvint/VQA_lora_PMC_LLaMA_PMCCLIP/choice/checkpoint-4000/pytorch_model.bin",
+            download_repo_id=medvint_repo_id,
+            download_filename="VQA_lora_PMC_LLaMA_PMCCLIP/choice/checkpoint-4000/pytorch_model.bin",
         )
 
         model_args = SimpleNamespace(
@@ -190,6 +216,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tokenizer-path", type=str, default="PMC_LLAMA_7B")
     p.add_argument("--model-repo-id", type=str, default="chaoyi-wu/PMC_LLAMA_7B")
     p.add_argument("--tokenizer-repo-id", type=str, default="chaoyi-wu/PMC_LLAMA_7B")
+    p.add_argument("--medvint-repo-id", type=str, default="xmcmic/MedVInT-TD")
     p.add_argument("--vision-model-path", type=str, default="medvint/pmc_clip/checkpoint.pt")
     p.add_argument(
         "--checkpoint",
@@ -337,6 +364,7 @@ def main() -> None:
             checkpoint=args.checkpoint,
             model_repo_id=args.model_repo_id,
             tokenizer_repo_id=args.tokenizer_repo_id,
+            medvint_repo_id=args.medvint_repo_id,
         )
 
     image_transform = transforms.Compose(
