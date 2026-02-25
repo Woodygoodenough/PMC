@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import csv
 import glob
 import json
@@ -15,9 +16,10 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from PIL import Image
 from torch.optim import AdamW
-from transformers import LlamaForCausalLM, LlamaTokenizer
+from transformers import LlamaForCausalLM, LlamaTokenizer, get_scheduler
 
 try:
     import webdataset as wds
@@ -185,6 +187,7 @@ def make_batch(
     pixels: list[torch.Tensor] = []
     first_answer_positions: list[int] = []
     first_answer_token_ids: list[int] = []
+    gold_labels: list[str] = []
 
     for _, payload, image in records:
         prompt, answer = build_prompt_and_answer(payload)
@@ -218,6 +221,7 @@ def make_batch(
         pixels.append(image_transform(image))
         first_answer_positions.append(first_answer_pos)
         first_answer_token_ids.append(first_answer_token)
+        gold_labels.append(answer)
 
     return {
         "input_ids": torch.tensor(input_ids, dtype=torch.long, device=device),
@@ -226,6 +230,7 @@ def make_batch(
         "pixel_values": torch.stack(pixels, dim=0).to(device=device, dtype=torch.float32),
         "first_answer_pos": torch.tensor(first_answer_positions, dtype=torch.long, device=device),
         "first_answer_token_id": torch.tensor(first_answer_token_ids, dtype=torch.long, device=device),
+        "gold_labels": gold_labels,
     }
 
 
@@ -283,6 +288,8 @@ def init_metrics_csv(path: Path) -> None:
                 "run_start_time",
                 "step_end_time",
                 "top1_any_tokens",
+                "pred_answer_dist",
+                "gold_answer_dist",
             ]
         )
 
@@ -300,6 +307,8 @@ def append_metrics_csv(path: Path, row: dict) -> None:
             row["run_start_time"],
             row["step_end_time"],
             row["top1_any_tokens"],
+            row["pred_answer_dist"],
+            row["gold_answer_dist"],
         ])
 
 
@@ -360,6 +369,18 @@ def top1_any_at_answer_positions(
     return toks
 
 
+def format_answer_distribution(items: list[str]) -> str:
+    ctr = collections.Counter()
+    for x in items:
+        lbl = x.strip()
+        if lbl in {"A", "B", "C", "D"}:
+            ctr[lbl] += 1
+        else:
+            ctr["OTHER"] += 1
+    order = ["A", "B", "C", "D", "OTHER"]
+    return "|".join(f"{k}:{ctr.get(k, 0)}" for k in order)
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train TestModel (PMC vision + Q-Former + PMC LLaMA)")
     p.add_argument("--checkpoints-dir", type=str, required=True)
@@ -382,6 +403,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-text-len", type=int, default=256)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=0.01)
+    p.add_argument("--warmup-steps", type=int, default=0)
+    p.add_argument("--scheduler-type", type=str, default="constant", choices=["constant", "linear", "cosine"])
+    p.add_argument("--label-smoothing", type=float, default=0.0)
+    p.add_argument("--max-grad-norm", type=float, default=1.0)
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda", "mps"])
 
@@ -469,6 +494,12 @@ def main() -> None:
     log(f"[model] trainable={trainable:,} / total={total:,} ({100.0 * trainable / max(total, 1):.4f}%)")
 
     optimizer = AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = get_scheduler(
+        name=args.scheduler_type,
+        optimizer=optimizer,
+        num_warmup_steps=args.warmup_steps,
+        num_training_steps=args.max_steps,
+    )
 
     image_transform = make_image_transform(args.image_size)
 
@@ -516,14 +547,25 @@ def main() -> None:
             pixel_values=batch["pixel_values"],
             labels=batch["labels"],
         )
-        loss = out.loss
+        if args.label_smoothing > 0.0:
+            shift_logits = out.logits[:, :-1, :].float().contiguous()
+            shift_labels = aligned_labels[:, 1:].contiguous()
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+                label_smoothing=args.label_smoothing,
+            )
+        else:
+            loss = out.loss
         if not torch.isfinite(loss):
             raise RuntimeError(f"Non-finite loss at step {step}: {loss.item()}")
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        grad_norm = nn.utils.clip_grad_norm_(params, max_norm=1.0)
+        grad_norm = nn.utils.clip_grad_norm_(params, max_norm=args.max_grad_norm)
         optimizer.step()
+        scheduler.step()
 
         token_acc, answer_acc = compute_metrics(
             logits=out.logits,
@@ -538,6 +580,8 @@ def main() -> None:
             first_answer_pos=batch["first_answer_pos"],
             tokenizer=tokenizer,
         )
+        pred_answer_dist = format_answer_distribution(top1_any_tokens)
+        gold_answer_dist = format_answer_distribution(batch["gold_labels"])
 
         row = {
             "step": step,
@@ -549,6 +593,8 @@ def main() -> None:
             "run_start_time": run_start_time,
             "step_end_time": datetime.now().isoformat(timespec="seconds"),
             "top1_any_tokens": "|".join(top1_any_tokens),
+            "pred_answer_dist": pred_answer_dist,
+            "gold_answer_dist": gold_answer_dist,
         }
         append_metrics_csv(metrics_csv, row)
         rows.append(row)
@@ -561,7 +607,9 @@ def main() -> None:
                 f"loss={row['loss']:.6f} ppl={ppl:.4f} "
                 f"token_acc={row['token_acc']:.4f} answer_acc={row['answer_acc']:.4f} "
                 f"grad_norm={float(grad_norm):.4f} "
-                f"top1_any_tokens={row['top1_any_tokens']}"
+                f"top1_any_tokens={row['top1_any_tokens']} "
+                f"pred_dist={row['pred_answer_dist']} "
+                f"gold_dist={row['gold_answer_dist']}"
             )
             save_training_curve(rows, curve_path)
 
