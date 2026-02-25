@@ -1,0 +1,2 @@
+step,loss,token_acc,answer_acc,lr,elapsed_sec
+1,12.98488617,0.00000000,0.00000000,0.0001000000,108.8321
