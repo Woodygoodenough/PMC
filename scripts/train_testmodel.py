@@ -7,7 +7,6 @@ import glob
 import json
 import math
 import random
-import shutil
 import sys
 import time
 from datetime import datetime
@@ -16,11 +15,8 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
-from huggingface_hub import hf_hub_download, try_to_load_from_cache
-from huggingface_hub.errors import LocalEntryNotFoundError
 from PIL import Image
 from torch.optim import AdamW
-from torchvision import transforms
 from transformers import LlamaForCausalLM, LlamaTokenizer
 
 try:
@@ -34,23 +30,7 @@ if str(MEDVINT_SRC) not in sys.path:
     sys.path.insert(0, str(MEDVINT_SRC))
 
 from models.blocks import ModifiedResNet, PMC_CLIP_cfg  # noqa: E402
-
-
-def choose_device(requested: str) -> str:
-    if requested != "auto":
-        return requested
-    if torch.cuda.is_available():
-        return "cuda"
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
-
-
-def resolve_shard_glob(datashards_dir: Path, shards: str) -> str:
-    pattern = Path(shards)
-    if pattern.is_absolute():
-        return str(pattern)
-    return str(datashards_dir / shards)
+from runtime_utils import choose_device, make_image_transform, resolve_hf_file, resolve_local_or_hub_ref, resolve_shard_glob
 
 
 def build_prompt_and_answer(payload: dict) -> tuple[str, str]:
@@ -71,95 +51,6 @@ def build_prompt_and_answer(payload: dict) -> tuple[str, str]:
         "Answer:"
     )
     return prompt, gold
-
-
-def _is_readable_file(path: Path) -> bool:
-    try:
-        if not path.is_file():
-            return False
-        with path.open("rb"):
-            return True
-    except OSError:
-        return False
-
-
-def _materialize(source: Path, target: Path) -> Path:
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if _is_readable_file(target):
-        return target
-    shutil.copy2(source, target)
-    if not _is_readable_file(target):
-        raise FileNotFoundError(f"Materialized file is not readable: {target}")
-    return target
-
-
-def resolve_vision_checkpoint(
-    checkpoints_dir: Path,
-    local_rel_path: str,
-    repo_id: str,
-    filename: str,
-    verbose: bool = True,
-) -> Path:
-    def log(msg: str) -> None:
-        if verbose:
-            print(msg, flush=True)
-
-    stable_target = (checkpoints_dir / local_rel_path).resolve()
-    if _is_readable_file(stable_target):
-        log(f"[cache] hit {stable_target}")
-        return stable_target
-
-    cache_dir = checkpoints_dir / "hf_cache"
-    remote_name = filename
-
-    cached = try_to_load_from_cache(repo_id=repo_id, filename=remote_name, cache_dir=str(cache_dir))
-    if isinstance(cached, str):
-        cached_path = Path(cached)
-        if _is_readable_file(cached_path):
-            out = _materialize(cached_path, stable_target)
-            log(f"[cache] hit hf://{repo_id}/{remote_name} -> {cached_path}")
-            if out != cached_path:
-                log(f"[cache] materialized {out}")
-            return out
-        log(f"[cache] stale hf entry ignored hf://{repo_id}/{remote_name} -> {cached_path}")
-
-    try:
-        local = hf_hub_download(
-            repo_id=repo_id,
-            filename=remote_name,
-            cache_dir=str(cache_dir),
-            local_files_only=True,
-        )
-        source = Path(local)
-        out = _materialize(source, stable_target)
-        log(f"[cache] hit hf://{repo_id}/{remote_name} -> {source}")
-        if out != source:
-            log(f"[cache] materialized {out}")
-        return out
-    except LocalEntryNotFoundError:
-        pass
-
-    log(f"[cache] miss {local_rel_path}; downloading {remote_name} from {repo_id}")
-    downloaded = Path(hf_hub_download(repo_id=repo_id, filename=remote_name, cache_dir=str(cache_dir)))
-    out = _materialize(downloaded, stable_target)
-    log(f"[cache] stored {downloaded}")
-    if out != downloaded:
-        log(f"[cache] materialized {out}")
-    return out
-
-
-def resolve_hf_model_ref(ref: str, default_repo: str, checkpoints_dir: Path) -> str:
-    candidate = Path(ref).expanduser()
-    if ref and candidate.exists():
-        return str(candidate.resolve())
-    default_local = checkpoints_dir / ref
-    if ref and default_local.exists():
-        return str(default_local.resolve())
-    if ref and "/" in ref:
-        return ref
-    if not ref:
-        return default_repo
-    raise FileNotFoundError(f"Model/tokenizer ref not found locally and is not a HF repo id: {ref}")
 
 
 class WebDatasetQATrainLoader:
@@ -274,7 +165,7 @@ class TestModel(nn.Module):
 def make_batch(
     records: list[tuple[str, dict, Image.Image]],
     tokenizer: LlamaTokenizer,
-    image_transform: transforms.Compose,
+    image_transform,
     max_text_len: int,
     device: str,
 ) -> dict[str, torch.Tensor]:
@@ -435,8 +326,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--datashards-dir", type=str, required=True)
     p.add_argument("--shards", type=str, default="train_2-*.tar")
 
-    p.add_argument("--llm-path", type=str, default="chaoyi-wu/PMC_LLAMA_7B")
-    p.add_argument("--tokenizer-path", type=str, default="chaoyi-wu/PMC_LLAMA_7B")
+    p.add_argument("--llm-path", type=str, default="PMC_LLAMA_7B")
+    p.add_argument("--tokenizer-path", type=str, default="PMC_LLAMA_7B")
+    p.add_argument("--llm-repo-id", type=str, default="chaoyi-wu/PMC_LLAMA_7B")
+    p.add_argument("--tokenizer-repo-id", type=str, default="chaoyi-wu/PMC_LLAMA_7B")
     p.add_argument("--llm-dtype", type=str, default="float16", choices=["float16", "bfloat16", "float32"])
 
     p.add_argument("--vision-model-path", type=str, default="medvint/pmc_clip/checkpoint.pt")
@@ -460,8 +353,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-query-tokens", type=int, default=32)
 
     p.add_argument("--log-every", type=int, default=1)
-    p.add_argument("--metrics-csv", type=str, default="logs/train_runs/testmodel_metrics.csv")
-    p.add_argument("--curve-path", type=str, default="logs/train_runs/testmodel_curve.png")
+    p.add_argument("--logs-dir", type=str, default="logs/train_runs")
+    p.add_argument("--metrics-csv", type=str, default="")
+    p.add_argument("--curve-path", type=str, default="")
     p.add_argument("--save-bridge-path", type=str, default="")
     p.add_argument("--verbose", action=argparse.BooleanOptionalAction, default=True)
     return p.parse_args()
@@ -488,7 +382,7 @@ def main() -> None:
     llm_torch_dtype = dtype_map[args.llm_dtype]
     hf_cache_dir = str(checkpoints_dir / "hf_cache")
 
-    vision_ckpt = resolve_vision_checkpoint(
+    vision_ckpt = resolve_hf_file(
         checkpoints_dir=checkpoints_dir,
         local_rel_path=args.vision_model_path,
         repo_id=args.vision_repo_id,
@@ -496,8 +390,12 @@ def main() -> None:
         verbose=args.verbose,
     )
 
-    resolved_llm_path = resolve_hf_model_ref(args.llm_path, "chaoyi-wu/PMC_LLAMA_7B", checkpoints_dir)
-    resolved_tokenizer_path = resolve_hf_model_ref(args.tokenizer_path, "chaoyi-wu/PMC_LLAMA_7B", checkpoints_dir)
+    resolved_llm_path = resolve_local_or_hub_ref(
+        args.llm_path, checkpoints_dir, default_repo_id=args.llm_repo_id
+    )
+    resolved_tokenizer_path = resolve_local_or_hub_ref(
+        args.tokenizer_path, checkpoints_dir, default_repo_id=args.tokenizer_repo_id
+    )
 
     tokenizer = LlamaTokenizer.from_pretrained(resolved_tokenizer_path, legacy=True, cache_dir=hf_cache_dir)
     if tokenizer.pad_token_id is None:
@@ -532,20 +430,24 @@ def main() -> None:
 
     optimizer = AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
 
-    image_transform = transforms.Compose(
-        [
-            transforms.Resize((args.image_size, args.image_size), interpolation=Image.BICUBIC),
-            transforms.ToTensor(),
-            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
-        ]
-    )
+    image_transform = make_image_transform(args.image_size)
 
     shard_pattern = resolve_shard_glob(datashards_dir, args.shards)
     loader = WebDatasetQATrainLoader(shard_pattern=shard_pattern)
     stream = iter(loader)
 
-    metrics_csv = Path(args.metrics_csv).expanduser().resolve()
-    curve_path = Path(args.curve_path).expanduser().resolve()
+    logs_dir = Path(args.logs_dir).expanduser().resolve()
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    metrics_csv = (
+        Path(args.metrics_csv).expanduser().resolve()
+        if args.metrics_csv
+        else (logs_dir / "testmodel_metrics.csv")
+    )
+    curve_path = (
+        Path(args.curve_path).expanduser().resolve()
+        if args.curve_path
+        else (logs_dir / "testmodel_curve.png")
+    )
     init_metrics_csv(metrics_csv)
     rows: list[dict] = []
 

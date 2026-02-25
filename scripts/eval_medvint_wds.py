@@ -8,16 +8,13 @@ import glob
 import json
 import random
 import re
-import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
 import torch
 import transformers
-from huggingface_hub import hf_hub_download, try_to_load_from_cache
-from huggingface_hub.errors import EntryNotFoundError, LocalEntryNotFoundError
 from PIL import Image
-from torchvision import transforms
+from runtime_utils import choose_device, make_image_transform, resolve_hf_file, resolve_local_or_hub_ref, resolve_shard_glob
 
 try:
     import webdataset as wds
@@ -39,35 +36,6 @@ class ModelManager:
     def _log(self, msg: str) -> None:
         if self.verbose:
             print(msg, flush=True)
-
-    @staticmethod
-    def _is_readable_file(path: Path) -> bool:
-        try:
-            if not path.is_file():
-                return False
-            with path.open("rb"):
-                return True
-        except OSError:
-            return False
-
-    def _materialize_checkpoint(self, source: Path, requested_value: str, default_rel: str) -> Path:
-        target = Path(requested_value) if requested_value else (self.checkpoints_dir / default_rel)
-        if not target.is_absolute():
-            target = self.checkpoints_dir / target
-        target = target.resolve()
-
-        if source.resolve() == target:
-            return source
-
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if self._is_readable_file(target):
-            return target
-
-        shutil.copy2(source, target)
-        if not self._is_readable_file(target):
-            raise FileNotFoundError(f"Materialized checkpoint is not readable: {target}")
-        self._log(f"[cache] materialized {target}")
-        return target
 
     @classmethod
     def _apply_compat_patches(cls, checkpoints_dir: Path, device: str, llm_torch_dtype: torch.dtype) -> None:
@@ -104,115 +72,14 @@ class ModelManager:
         torch.load = patched_torch_load
         cls._patch_applied = True
 
-    def _resolve_path(
-        self,
-        value: str,
-        default_rel: str,
-        download_repo_id: str | None = None,
-        download_filename: str | None = None,
-    ) -> Path:
-        candidate = Path(value) if value else self.checkpoints_dir / default_rel
-        if candidate.is_absolute() and candidate.exists():
-            self._log(f"[cache] hit {candidate}")
-            return candidate
-
-        alt = (self.checkpoints_dir / value) if value else (self.checkpoints_dir / default_rel)
-        if alt.exists():
-            self._log(f"[cache] hit {alt}")
-            return alt
-
-        if candidate.exists():
-            self._log(f"[cache] hit {candidate}")
-            return candidate
-
-        if download_repo_id:
-            remote_name = download_filename or (value if value else default_rel)
-            if remote_name.startswith("medvint/"):
-                remote_name = remote_name[len("medvint/") :]
-
-            # First-class cache probe (no network).
-            cached = try_to_load_from_cache(
-                repo_id=download_repo_id,
-                filename=remote_name,
-                cache_dir=str(self.checkpoints_dir / "hf_cache"),
-            )
-            if isinstance(cached, str):
-                cached_path = Path(cached)
-                if self._is_readable_file(cached_path):
-                    self._log(f"[cache] hit hf://{download_repo_id}/{remote_name} -> {cached_path}")
-                    return self._materialize_checkpoint(cached_path, value, default_rel)
-                self._log(f"[cache] stale hf entry ignored hf://{download_repo_id}/{remote_name} -> {cached_path}")
-
-            # Fallback for environments where refs metadata is stale but snapshots exist.
-            repo_cache_dir = self.checkpoints_dir / "hf_cache" / f"models--{download_repo_id.replace('/', '--')}"
-            snapshot_hits = sorted(repo_cache_dir.glob(f"snapshots/*/{remote_name}"))
-            for picked in reversed(snapshot_hits):
-                if self._is_readable_file(picked):
-                    self._log(f"[cache] hit snapshot://{download_repo_id}/{remote_name} -> {picked}")
-                    return self._materialize_checkpoint(picked, value, default_rel)
-                self._log(f"[cache] stale snapshot ignored snapshot://{download_repo_id}/{remote_name} -> {picked}")
-
-            try:
-                cached = hf_hub_download(
-                    repo_id=download_repo_id,
-                    filename=remote_name,
-                    cache_dir=str(self.checkpoints_dir / "hf_cache"),
-                    local_files_only=True,
-                )
-                self._log(f"[cache] hit hf://{download_repo_id}/{remote_name} -> {cached}")
-                return self._materialize_checkpoint(Path(cached), value, default_rel)
-            except LocalEntryNotFoundError:
-                pass
-
-            self._log(f"[cache] miss {value or default_rel}; downloading {remote_name} from {download_repo_id}")
-            try:
-                downloaded = hf_hub_download(
-                    repo_id=download_repo_id,
-                    filename=remote_name,
-                    cache_dir=str(self.checkpoints_dir / "hf_cache"),
-                )
-            except EntryNotFoundError as e:
-                raise FileNotFoundError(
-                    f"Remote file not found: repo={download_repo_id}, filename={remote_name}. "
-                    "Override with --vision-repo-id/--vision-filename or "
-                    "--checkpoint-repo-id/--checkpoint-filename."
-                ) from e
-            self._log(f"[cache] stored {downloaded}")
-            return self._materialize_checkpoint(Path(downloaded), value, default_rel)
-
-        raise FileNotFoundError(f"Could not resolve checkpoint path: {value or default_rel}")
-
-    def _resolve_local_or_hub(self, value: str, default_rel: str, hub_fallback: str | None = None) -> str:
-        candidate = Path(value) if value else self.checkpoints_dir / default_rel
-        if candidate.is_absolute() and candidate.exists():
-            self._log(f"[cache] hit {candidate}")
-            return str(candidate)
-
-        alt = (self.checkpoints_dir / value) if value else (self.checkpoints_dir / default_rel)
-        if alt.exists():
-            self._log(f"[cache] hit {alt}")
-            return str(alt)
-
-        if candidate.exists():
-            self._log(f"[cache] hit {candidate}")
-            return str(candidate)
-
-        if value and "/" in value and not value.endswith((".bin", ".pt", ".json", ".model")):
-            return value
-
-        if hub_fallback:
-            return hub_fallback
-
-        raise FileNotFoundError(f"Could not resolve model/tokenizer path locally: {value or default_rel}")
-
     def load(
         self,
-        model_path: str | None,
+        llm_path: str | None,
         tokenizer_path: str | None,
         vision_model_path: str | None,
-        checkpoint: str | None,
+        checkpoint_path: str | None,
         llm_torch_dtype: torch.dtype,
-        model_repo_id: str | None = None,
+        llm_repo_id: str | None = None,
         tokenizer_repo_id: str | None = None,
         vision_repo_id: str | None = None,
         vision_filename: str | None = None,
@@ -234,22 +101,27 @@ class ModelManager:
 
         from models.QA_model import QA_model
 
-        resolved_model_path = self._resolve_local_or_hub(model_path or "", "PMC_LLAMA_7B", hub_fallback=model_repo_id)
-        resolved_tokenizer_path = self._resolve_local_or_hub(
-            tokenizer_path or "", "PMC_LLAMA_7B", hub_fallback=tokenizer_repo_id
+        resolved_model_path = resolve_local_or_hub_ref(
+            llm_path or "", checkpoints_dir=self.checkpoints_dir, default_repo_id=llm_repo_id
         )
-        resolved_vision_path = self._resolve_path(
-            vision_model_path or "",
-            "medvint/pmc_clip/checkpoint.pt",
-            download_repo_id=vision_repo_id,
-            download_filename=vision_filename or "pmc_clip/checkpoint.pt",
+        resolved_tokenizer_path = resolve_local_or_hub_ref(
+            tokenizer_path or "", checkpoints_dir=self.checkpoints_dir, default_repo_id=tokenizer_repo_id
         )
-        resolved_checkpoint = self._resolve_path(
-            checkpoint or "",
-            "medvint/VQA_lora_PMC_LLaMA_PMCCLIP/choice/checkpoint-4000/pytorch_model.bin",
-            download_repo_id=checkpoint_repo_id,
-            download_filename=checkpoint_filename
-            or "VQA_lora_PMC_LLaMA_PMCCLIP/choice/checkpoint-4000/pytorch_model.bin",
+        resolved_vision_path = resolve_hf_file(
+            checkpoints_dir=self.checkpoints_dir,
+            local_rel_path=(vision_model_path or "medvint/pmc_clip/checkpoint.pt"),
+            repo_id=(vision_repo_id or "xmcmic/MedVInT-TE"),
+            filename=(vision_filename or "pmc_clip/checkpoint.pt"),
+            verbose=self.verbose,
+            log_fn=self._log,
+        )
+        resolved_checkpoint = resolve_hf_file(
+            checkpoints_dir=self.checkpoints_dir,
+            local_rel_path=(checkpoint_path or "medvint/VQA_lora_PMC_LLaMA_PMCCLIP/choice/checkpoint-4000/pytorch_model.bin"),
+            repo_id=(checkpoint_repo_id or "xmcmic/MedVInT-TD"),
+            filename=(checkpoint_filename or "VQA_lora_PMC_LLaMA_PMCCLIP/choice/checkpoint-4000/pytorch_model.bin"),
+            verbose=self.verbose,
+            log_fn=self._log,
         )
 
         self._log(f"[model] llm={resolved_model_path}")
@@ -335,9 +207,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--datashards-dir", type=str, default=str(repo / "data/webdataset_v2/test_clean"))
     p.add_argument("--shards", type=str, default="test_clean-*.tar", help="Glob relative to --datashards-dir or absolute")
 
-    p.add_argument("--model-path", type=str, default="PMC_LLAMA_7B")
+    p.add_argument("--llm-path", "--model-path", dest="llm_path", type=str, default="PMC_LLAMA_7B")
     p.add_argument("--tokenizer-path", type=str, default="PMC_LLAMA_7B")
-    p.add_argument("--model-repo-id", type=str, default="chaoyi-wu/PMC_LLAMA_7B")
+    p.add_argument("--llm-repo-id", "--model-repo-id", dest="llm_repo_id", type=str, default="chaoyi-wu/PMC_LLAMA_7B")
     p.add_argument("--tokenizer-repo-id", type=str, default="chaoyi-wu/PMC_LLAMA_7B")
     p.add_argument("--vision-repo-id", type=str, default="xmcmic/MedVInT-TE")
     p.add_argument("--vision-filename", type=str, default="pmc_clip/checkpoint.pt")
@@ -349,7 +221,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--vision-model-path", type=str, default="medvint/pmc_clip/checkpoint.pt")
     p.add_argument(
-        "--checkpoint",
+        "--checkpoint-path", "--checkpoint",
+        dest="checkpoint_path",
         type=str,
         default="medvint/VQA_lora_PMC_LLaMA_PMCCLIP/choice/checkpoint-4000/pytorch_model.bin",
     )
@@ -362,16 +235,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--predictor", type=str, default="model", choices=["model", "oracle", "random"])
     p.add_argument("--verbose", action=argparse.BooleanOptionalAction, default=True)
     return p
-
-
-def choose_device(requested: str) -> str:
-    if requested != "auto":
-        return requested
-    if torch.cuda.is_available():
-        return "cuda"
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
 
 
 def similarity(a: str, b: str) -> float:
@@ -409,13 +272,6 @@ def remap_state_dict_keys(
         remapped[selected] = value
 
     return remapped
-
-
-def resolve_shard_glob(datashards_dir: Path, shards: str) -> str:
-    pattern = Path(shards)
-    if pattern.is_absolute():
-        return str(pattern)
-    return str(datashards_dir / shards)
 
 
 class WebDatasetQALoader:
@@ -509,12 +365,12 @@ def main() -> None:
     if args.predictor == "model":
         manager = ModelManager(repo_root=repo_root, checkpoints_dir=checkpoints_dir, device=device, verbose=args.verbose)
         model, tokenizer = manager.load(
-            model_path=args.model_path,
+            llm_path=args.llm_path,
             tokenizer_path=args.tokenizer_path,
             vision_model_path=args.vision_model_path,
-            checkpoint=args.checkpoint,
+            checkpoint_path=args.checkpoint_path,
             llm_torch_dtype=llm_torch_dtype,
-            model_repo_id=args.model_repo_id,
+            llm_repo_id=args.llm_repo_id,
             tokenizer_repo_id=args.tokenizer_repo_id,
             vision_repo_id=args.vision_repo_id,
             vision_filename=args.vision_filename,
@@ -522,13 +378,7 @@ def main() -> None:
             checkpoint_filename=args.checkpoint_filename,
         )
 
-    image_transform = transforms.Compose(
-        [
-            transforms.Resize((args.image_size, args.image_size), interpolation=Image.BICUBIC),
-            transforms.ToTensor(),
-            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
-        ]
-    )
+    image_transform = make_image_transform(args.image_size)
 
     shard_pattern = resolve_shard_glob(datashards_dir, args.shards)
     log(f"[data] shard_pattern={shard_pattern}")
