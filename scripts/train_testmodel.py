@@ -10,6 +10,7 @@ import random
 import shutil
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -367,7 +368,18 @@ def init_metrics_csv(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["step", "loss", "token_acc", "answer_acc", "lr", "elapsed_sec"])
+        writer.writerow(
+            [
+                "step",
+                "loss",
+                "token_acc",
+                "answer_acc",
+                "lr",
+                "elapsed_sec",
+                "run_start_time",
+                "step_end_time",
+            ]
+        )
 
 
 def append_metrics_csv(path: Path, row: dict) -> None:
@@ -380,6 +392,8 @@ def append_metrics_csv(path: Path, row: dict) -> None:
             f"{row['answer_acc']:.8f}",
             f"{row['lr']:.10f}",
             f"{row['elapsed_sec']:.4f}",
+            row["run_start_time"],
+            row["step_end_time"],
         ])
 
 
@@ -535,7 +549,8 @@ def main() -> None:
     init_metrics_csv(metrics_csv)
     rows: list[dict] = []
 
-    start = time.time()
+    run_start_ts = time.time()
+    run_start_time = datetime.now().isoformat(timespec="seconds")
     for step in range(1, args.max_steps + 1):
         records = []
         for _ in range(args.batch_size):
@@ -582,7 +597,9 @@ def main() -> None:
             "token_acc": float(token_acc),
             "answer_acc": float(answer_acc),
             "lr": float(optimizer.param_groups[0]["lr"]),
-            "elapsed_sec": float(time.time() - start),
+            "elapsed_sec": float(time.time() - run_start_ts),
+            "run_start_time": run_start_time,
+            "step_end_time": datetime.now().isoformat(timespec="seconds"),
         }
         append_metrics_csv(metrics_csv, row)
         rows.append(row)
