@@ -189,7 +189,7 @@ def make_batch(
     for _, payload, image in records:
         prompt, answer = build_prompt_and_answer(payload)
         prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
-        answer_ids = tokenizer.encode(f" {answer}", add_special_tokens=False)
+        answer_ids = tokenizer.encode(answer, add_special_tokens=False)
         if not answer_ids:
             answer_ids = [tokenizer.eos_token_id]
 
@@ -282,6 +282,7 @@ def init_metrics_csv(path: Path) -> None:
                 "elapsed_sec",
                 "run_start_time",
                 "step_end_time",
+                "top1_any_tokens",
             ]
         )
 
@@ -298,6 +299,7 @@ def append_metrics_csv(path: Path, row: dict) -> None:
             f"{row['elapsed_sec']:.4f}",
             row["run_start_time"],
             row["step_end_time"],
+            row["top1_any_tokens"],
         ])
 
 
@@ -331,6 +333,31 @@ def save_training_curve(rows: list[dict], curve_path: Path) -> None:
     fig.tight_layout()
     fig.savefig(curve_path, dpi=150)
     plt.close(fig)
+
+
+def top1_any_at_answer_positions(
+    logits: torch.Tensor,
+    prefix_len: int,
+    first_answer_pos: torch.Tensor,
+    tokenizer: LlamaTokenizer,
+) -> list[str]:
+    pred_ids = logits.argmax(dim=-1)
+    toks: list[str] = []
+    bsz = pred_ids.shape[0]
+    for i in range(bsz):
+        pos = int(first_answer_pos[i].item())
+        if pos < 0:
+            toks.append("<invalid>")
+            continue
+        label_idx = prefix_len + pos
+        pred_idx = label_idx - 1
+        if pred_idx < 0 or pred_idx >= pred_ids.shape[1]:
+            toks.append("<oob>")
+            continue
+        tok_id = int(pred_ids[i, pred_idx].item())
+        tok_txt = tokenizer.decode([tok_id]).replace("\n", "\\n")
+        toks.append(tok_txt)
+    return toks
 
 
 def parse_args() -> argparse.Namespace:
@@ -505,6 +532,12 @@ def main() -> None:
             first_answer_pos=batch["first_answer_pos"],
             first_answer_token_id=batch["first_answer_token_id"],
         )
+        top1_any_tokens = top1_any_at_answer_positions(
+            logits=out.logits,
+            prefix_len=prefix_len,
+            first_answer_pos=batch["first_answer_pos"],
+            tokenizer=tokenizer,
+        )
 
         row = {
             "step": step,
@@ -515,6 +548,7 @@ def main() -> None:
             "elapsed_sec": float(time.time() - run_start_ts),
             "run_start_time": run_start_time,
             "step_end_time": datetime.now().isoformat(timespec="seconds"),
+            "top1_any_tokens": "|".join(top1_any_tokens),
         }
         append_metrics_csv(metrics_csv, row)
         rows.append(row)
@@ -526,7 +560,8 @@ def main() -> None:
                 f"step={step}/{args.max_steps} "
                 f"loss={row['loss']:.6f} ppl={ppl:.4f} "
                 f"token_acc={row['token_acc']:.4f} answer_acc={row['answer_acc']:.4f} "
-                f"grad_norm={float(grad_norm):.4f}"
+                f"grad_norm={float(grad_norm):.4f} "
+                f"top1_any_tokens={row['top1_any_tokens']}"
             )
             save_training_curve(rows, curve_path)
 
