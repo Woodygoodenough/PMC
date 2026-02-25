@@ -14,7 +14,14 @@ from types import SimpleNamespace
 import torch
 import transformers
 from PIL import Image
-from runtime_utils import choose_device, make_image_transform, resolve_hf_file, resolve_local_or_hub_ref, resolve_shard_glob
+from runtime_utils import (
+    choose_device,
+    extract_choice_label,
+    make_image_transform,
+    resolve_hf_file,
+    resolve_local_or_hub_ref,
+    resolve_shard_glob,
+)
 
 try:
     import webdataset as wds
@@ -307,7 +314,7 @@ def build_prompt(payload: dict) -> tuple[str, list[str], str]:
     ]
     question = payload.get("question", "")
     prompt = f"Question: {question}Choices:{choices[0]}{choices[1]}{choices[2]}{choices[3]}The Answer is:"
-    gold_label = str(payload.get("answer_label", "")).strip().upper()[:1]
+    gold_label = extract_choice_label(payload)
     return prompt, choices, gold_label
 
 

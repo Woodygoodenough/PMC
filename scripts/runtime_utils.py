@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+import re
 from pathlib import Path
 
 import torch
@@ -144,3 +145,31 @@ def resolve_hf_file(
     if out != downloaded:
         log(f"[cache] materialized {out}")
     return out
+
+
+def extract_choice_label(payload: dict) -> str:
+    def normalize(value) -> str:
+        if value is None:
+            return ""
+        text = str(value).strip()
+        if not text or text.lower() == "none":
+            return ""
+        up = text.upper()
+        if up in {"A", "B", "C", "D"}:
+            return up
+        if up.isdigit():
+            n = int(up)
+            if n in {0, 1, 2, 3}:
+                return "ABCD"[n]
+            if n in {1, 2, 3, 4}:
+                return "ABCD"[n - 1]
+        m = re.search(r"\b([ABCD])\b", up)
+        if m:
+            return m.group(1)
+        return ""
+
+    for key in ("answer_label", "answer", "label", "gt", "correct_answer"):
+        label = normalize(payload.get(key))
+        if label:
+            return label
+    return ""

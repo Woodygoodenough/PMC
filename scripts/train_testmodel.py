@@ -30,7 +30,14 @@ if str(MEDVINT_SRC) not in sys.path:
     sys.path.insert(0, str(MEDVINT_SRC))
 
 from models.blocks import ModifiedResNet, PMC_CLIP_cfg  # noqa: E402
-from runtime_utils import choose_device, make_image_transform, resolve_hf_file, resolve_local_or_hub_ref, resolve_shard_glob
+from runtime_utils import (
+    choose_device,
+    extract_choice_label,
+    make_image_transform,
+    resolve_hf_file,
+    resolve_local_or_hub_ref,
+    resolve_shard_glob,
+)
 
 
 def build_prompt_and_answer(payload: dict) -> tuple[str, str]:
@@ -41,7 +48,9 @@ def build_prompt_and_answer(payload: dict) -> tuple[str, str]:
         str(payload.get("choice_c", "")).strip(),
         str(payload.get("choice_d", "")).strip(),
     ]
-    gold = str(payload.get("answer_label", "")).strip().upper()[:1]
+    gold = extract_choice_label(payload)
+    if gold not in {"A", "B", "C", "D"}:
+        raise ValueError(f"Could not derive A/B/C/D label from payload keys: {list(payload.keys())}")
     prompt = (
         f"Question: {question}\n"
         f"A. {choices[0]}\n"
@@ -227,11 +236,14 @@ def compute_metrics(
     first_answer_pos: torch.Tensor,
     first_answer_token_id: torch.Tensor,
 ) -> tuple[float, float]:
+    # Causal LM predicts label[t] from logits[t-1], so metrics must use shifted positions.
     pred_ids = logits.argmax(dim=-1)
+    shift_pred = pred_ids[:, :-1]
+    shift_labels = aligned_labels[:, 1:]
 
-    supervised = aligned_labels != -100
+    supervised = shift_labels != -100
     if supervised.any():
-        token_acc = (pred_ids[supervised] == aligned_labels[supervised]).float().mean().item()
+        token_acc = (shift_pred[supervised] == shift_labels[supervised]).float().mean().item()
     else:
         token_acc = float("nan")
 
@@ -242,11 +254,12 @@ def compute_metrics(
         pos = int(first_answer_pos[i].item())
         if pos < 0:
             continue
-        idx = prefix_len + pos
-        if idx >= logits.shape[1]:
+        label_idx = prefix_len + pos
+        pred_idx = label_idx - 1
+        if pred_idx < 0 or pred_idx >= logits.shape[1]:
             continue
         valid += 1
-        pred = int(pred_ids[i, idx].item())
+        pred = int(pred_ids[i, pred_idx].item())
         gold = int(first_answer_token_id[i].item())
         if pred == gold:
             correct += 1
